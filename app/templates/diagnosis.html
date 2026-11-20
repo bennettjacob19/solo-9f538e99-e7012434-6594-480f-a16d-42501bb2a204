@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}Diagnosis #{{ d.id }} · Tail Sampler{% endblock %}
+{% block content %}
+<div class="toolbar">
+  <a href="/">← All traces</a>
+  <span class="spacer"></span>
+  <span class="badge {{ view.tone }}">{{ view.label }}</span>
+</div>
+
+<div class="grid">
+  <div class="card"><div class="label">Diagnosis</div><div class="value">#{{ d.id }}</div>
+    <div class="small muted">{{ d.createdAtNs|utc_time }}</div></div>
+  <div class="card"><div class="label">Conclusion</div>
+    <div class="value" style="font-size:16px">{{ view.label }}</div>
+    <div class="small muted">{{ d.reason }}</div></div>
+  <div class="card"><div class="label">Offset latitude δ(A) − δ(B)</div>
+    <div class="value mono" style="font-size:16px">{{ view.min_delta }} … {{ view.max_delta }}</div>
+    <div class="small muted">corrected start diff A−B: {{ view.min_corr }} … {{ view.max_corr }}</div></div>
+  <div class="card"><div class="label">Services ({{ d.services|length }})</div>
+    <div>{% for s in d.services %}<span class="tag">{{ s }}</span>{% endfor %}</div>
+    <div class="small muted">one fixed clock offset each</div></div>
+</div>
+
+<h2>Target spans</h2>
+<table>
+  <thead><tr><th>Target</th><th>Trace ID</th><th>Span ID</th><th>Service</th><th>Name</th><th>Kind</th><th>Raw start (ns)</th><th>Raw end (ns)</th></tr></thead>
+  <tbody>
+  {% for key, t in [("A", d.targets.a), ("B", d.targets.b)] %}
+    <tr>
+      <td><strong>{{ key }}</strong></td>
+      <td class="mono small"><a href="/traces/{{ t.traceId }}">{{ t.traceId }}</a></td>
+      <td class="mono small">{{ t.spanId }}</td>
+      <td>{{ t.service }}</td>
+      <td>{{ t.name or "—" }}</td>
+      <td>{{ t.kind }}</td>
+      <td class="mono">{{ t.startTimeNs if t.startTimeNs is not none else "—" }}</td>
+      <td class="mono">{{ t.endTimeNs if t.endTimeNs is not none else "—" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="small muted">
+  Raw start difference A−B:
+  {{ d.rawStartDiffNs if d.rawStartDiffNs is not none else "—" }}
+  {% if d.rawStartDiffNs is not none %}ns{% endif %}
+  · traces examined:
+  {% for tid in d.traceIds %}<a class="mono" href="/traces/{{ tid }}">{{ tid[:12] }}…</a>{% if not loop.last %}, {% endif %}{% endfor %}
+</p>
+
+{% if d.conflict %}
+<h2>Conflicting calls — cannot hold simultaneously</h2>
+<p class="small muted">
+  No single clock offset per service satisfies every containment constraint, so no
+  ordering can be derived. The following {{ view.conflict_calls|length }} call(s) cannot
+  hold at the same time:
+</p>
+<table>
+  <thead><tr><th>#</th><th>Trace</th><th>Client span</th><th>Client service</th><th>Client start (ns)</th><th>Client end (ns)</th><th>Server span</th><th>Server service</th><th>Server start (ns)</th><th>Server end (ns)</th></tr></thead>
+  <tbody>
+  {% for c in view.conflict_calls %}
+    <tr>
+      <td class="mono">{{ c.index }}</td>
+      <td class="mono small">{{ c.traceId[:12] }}…</td>
+      <td class="mono small">{{ c.clientSpanId }}</td>
+      <td>{{ c.clientService }}</td>
+      <td class="mono">{{ c.clientStartNs }}</td>
+      <td class="mono">{{ c.clientEndNs }}</td>
+      <td class="mono small">{{ c.serverSpanId }}</td>
+      <td>{{ c.serverService }}</td>
+      <td class="mono">{{ c.serverStartNs }}</td>
+      <td class="mono">{{ c.serverEndNs }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>CLIENT→SERVER call pairs used as constraints ({{ d.calls|length }})</h2>
+{% if d.calls %}
+<table>
+  <thead><tr><th>#</th><th>Trace</th><th>Client span</th><th>Client service</th><th>Client start (ns)</th><th>Client end (ns)</th><th>Server span</th><th>Server service</th><th>Server start (ns)</th><th>Server end (ns)</th></tr></thead>
+  <tbody>
+  {% for c in d.calls %}
+    <tr {% if loop.index0 in view.conflict_indices %}class="conflict"{% endif %}>
+      <td class="mono">{{ loop.index0 }}</td>
+      <td class="mono small">{{ c.traceId[:12] }}…</td>
+      <td class="mono small">{{ c.clientSpanId }}</td>
+      <td>{{ c.clientService }}</td>
+      <td class="mono">{{ c.clientStartNs }}</td>
+      <td class="mono">{{ c.clientEndNs }}</td>
+      <td class="mono small">{{ c.serverSpanId }}</td>
+      <td>{{ c.serverService }}</td>
+      <td class="mono">{{ c.serverStartNs }}</td>
+      <td class="mono">{{ c.serverEndNs }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">
+  No direct CLIENT→SERVER parent-child call with complete, valid start/end times exists
+  in the selected traces, so the services' clocks are unconstrained.
+</p>
+{% endif %}
+{% endblock %}

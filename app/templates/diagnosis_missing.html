@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Diagnosis not found{% endblock %}
+{% block content %}
+<h2>Diagnosis #{{ diagnosis_id }} does not exist</h2>
+<p class="muted">
+  Diagnosis numbers are handed out only after the record has been saved. Check the
+  number, or run a new diagnosis from the overview page.
+</p>
+<p><a href="/">← Back to overview</a></p>
+{% endblock %}

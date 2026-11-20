@@ -63,6 +63,20 @@ CREATE INDEX IF NOT EXISTS idx_archived_traces_archived_at
     ON archived_traces (archived_at_ns DESC);
 CREATE INDEX IF NOT EXISTS idx_archived_spans_trace
     ON archived_spans (trace_id, seq);
+
+-- Diagnosis records are self-contained: the conclusion and every piece of
+-- evidence (target spans, call pairs, raw nanosecond times) are frozen into
+-- record_json at save time.  Re-archiving a trace with the same id or
+-- restarting the service therefore never changes what a diagnosis id shows.
+CREATE TABLE IF NOT EXISTS diagnoses (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at_ns   INTEGER NOT NULL,
+    conclusion      TEXT NOT NULL,
+    trace_ids_json  TEXT NOT NULL DEFAULT '[]',
+    record_json     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_diagnoses_id ON diagnoses (id DESC);
 """
 
 
@@ -181,10 +195,88 @@ class ArchiveStore:
                 "SELECT * FROM archived_spans WHERE trace_id = ? ORDER BY seq, span_id",
                 (trace_id,),
             ).fetchall()
-        trace = dict(row)
-        trace["service_names"] = json.loads(trace.get("service_names") or "[]")
-        trace["spans"] = [self._span_from_row(span) for span in span_rows]
-        return trace
+        return self._trace_from_rows(row, span_rows)
+
+    def open_snapshot(self) -> "SnapshotReader":
+        """Open a consistent read-only view of the archive.
+
+        The reader uses its own connection inside one transaction, so every
+        trace read through it comes from the same committed state.  Because
+        the database runs in WAL mode, archiving of new traces continues
+        while the snapshot is open.
+        """
+
+        conn = sqlite3.connect(self.path, timeout=10.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return SnapshotReader(conn)
+
+    # ------------------------------------------------------------- diagnoses
+    def save_diagnosis(self, record: dict[str, Any]) -> int:
+        """Persist a diagnosis record and return its id.
+
+        The id is handed out only after the commit has succeeded.
+        """
+
+        payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        trace_ids = json.dumps(record.get("traceIds") or [], ensure_ascii=False)
+        created_at_ns = time.time_ns()
+        with self._lock:
+            conn = self._conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "INSERT INTO diagnoses (created_at_ns, conclusion,"
+                    " trace_ids_json, record_json) VALUES (?, ?, ?, ?)",
+                    (
+                        created_at_ns,
+                        str(record.get("conclusion") or ""),
+                        trace_ids,
+                        payload,
+                    ),
+                )
+                diagnosis_id = int(cursor.lastrowid)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return diagnosis_id
+
+    def get_diagnosis(self, diagnosis_id: int) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, created_at_ns, record_json FROM diagnoses WHERE id = ?",
+                (int(diagnosis_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        record = json.loads(row["record_json"])
+        record["id"] = row["id"]
+        record["createdAtNs"] = row["created_at_ns"]
+        return record
+
+    def list_diagnoses(
+        self, limit: int = 50, offset: int = 0
+    ) -> tuple[list[dict], int]:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        with self._lock:
+            total = self._conn.execute("SELECT COUNT(*) FROM diagnoses").fetchone()[0]
+            rows = self._conn.execute(
+                "SELECT id, created_at_ns, conclusion, trace_ids_json"
+                " FROM diagnoses ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        items = []
+        for row in rows:
+            items.append(
+                {
+                    "id": row["id"],
+                    "createdAtNs": row["created_at_ns"],
+                    "conclusion": row["conclusion"],
+                    "traceIds": json.loads(row["trace_ids_json"] or "[]"),
+                }
+            )
+        return items, int(total)
 
     def list_traces(self, limit: int = 100, offset: int = 0) -> tuple[list[dict], int]:
         limit = max(1, min(int(limit), 500))
@@ -214,6 +306,13 @@ class ArchiveStore:
             )
 
     @staticmethod
+    def _trace_from_rows(row: sqlite3.Row, span_rows: list[sqlite3.Row]) -> dict[str, Any]:
+        trace = dict(row)
+        trace["service_names"] = json.loads(trace.get("service_names") or "[]")
+        trace["spans"] = [ArchiveStore._span_from_row(span) for span in span_rows]
+        return trace
+
+    @staticmethod
     def _span_from_row(row: sqlite3.Row) -> dict[str, Any]:
         span = dict(row)
         for key in ("attributes_json", "resource_json", "scope_json", "raw_json"):
@@ -223,3 +322,48 @@ class ArchiveStore:
                 span[key[:-5]] = {}
         span["is_error"] = span.get("status_code") == "ERROR"
         return span
+
+
+class SnapshotReader:
+    """One committed state of the archive, read through its own connection.
+
+    All reads inside the transaction see the same committed snapshot; the
+    writer connection is never blocked (WAL), so archiving continues while a
+    diagnosis reads.  Use as a context manager.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._closed = False
+        self._conn.execute("BEGIN DEFERRED")
+
+    def read_trace(self, trace_id: str) -> Optional[dict[str, Any]]:
+        if self._closed:
+            raise RuntimeError("snapshot is closed")
+        trace_id = trace_id.strip().lower()
+        row = self._conn.execute(
+            "SELECT * FROM archived_traces WHERE trace_id = ?", (trace_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        span_rows = self._conn.execute(
+            "SELECT * FROM archived_spans WHERE trace_id = ? ORDER BY seq, span_id",
+            (trace_id,),
+        ).fetchall()
+        return ArchiveStore._trace_from_rows(row, span_rows)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            try:
+                self._conn.execute("ROLLBACK")
+            except sqlite3.Error:  # pragma: no cover - defensive
+                pass
+            self._conn.close()
+
+    def __enter__(self) -> "SnapshotReader":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self.close()
+        return False

@@ -29,6 +29,58 @@
 <p class="small muted">Complete traces waiting to be written are not listed until their commit succeeds. Their slots stay reserved until then{% if status.paused %} — archiving is paused, resume to flush them{% endif %}.</p>
 {% endif %}
 
+<h2>Clock-skew diagnosis</h2>
+<div class="card">
+  <p class="small muted">
+    Duplicate-charge postmortem: which started first — the gateway retry or the payment
+    service's first debit? Pick 2–8 archived traces and two target spans. Each service
+    (<span class="mono">service.name</span>) gets one fixed clock offset; for every direct
+    CLIENT→SERVER parent-child call with complete, valid times the corrected SERVER interval
+    must lie inside the CLIENT interval. A definite order is reported only when it holds
+    under every feasible offset — otherwise the result is "cannot be determined".
+  </p>
+  {% if diagnosis_error %}
+  <div class="toast error-text">{{ diagnosis_error }}</div>
+  {% endif %}
+  <form method="post" action="/diagnoses">
+    <label for="trace_ids">Archived trace IDs — 2 to 8, one per line</label>
+    <textarea id="trace_ids" name="trace_ids" rows="4" spellcheck="false"
+      placeholder="0123456789abcdef0123456789abcdef"></textarea>
+    <div class="cols">
+      <div>
+        <label for="target_a_trace">Target A — trace ID</label>
+        <input type="text" id="target_a_trace" name="target_a_trace" autocomplete="off" spellcheck="false">
+        <label for="target_a_span">Target A — span ID</label>
+        <input type="text" id="target_a_span" name="target_a_span" autocomplete="off" spellcheck="false">
+      </div>
+      <div>
+        <label for="target_b_trace">Target B — trace ID</label>
+        <input type="text" id="target_b_trace" name="target_b_trace" autocomplete="off" spellcheck="false">
+        <label for="target_b_span">Target B — span ID</label>
+        <input type="text" id="target_b_span" name="target_b_span" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <div class="toolbar"><button class="primary" type="submit">Run diagnosis</button></div>
+  </form>
+</div>
+
+{% if diagnoses %}
+<h2>Recent diagnoses</h2>
+<table>
+  <thead><tr><th>#</th><th>Conclusion</th><th>Traces</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for g in diagnoses %}
+    <tr>
+      <td class="mono"><a href="/diagnoses/{{ g.id }}">#{{ g.id }}</a></td>
+      <td>{{ g.conclusion|conclusion_label }}</td>
+      <td class="mono">{{ g.traceIds|length }}</td>
+      <td class="mono small">{{ g.createdAtNs|utc_time }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
 <h2>Archived traces</h2>
 {% if traces %}
 <table>

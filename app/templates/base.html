@@ -47,6 +47,14 @@
            border-radius: 8px; padding: 7px 14px; cursor: pointer; font: inherit; }
   button:hover { border-color: var(--accent); }
   button.primary { background: #24406e; border-color: #3b5f9e; }
+  input[type=text], textarea { width: 100%; background: var(--panel-2); color: var(--fg);
+           border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+           font: inherit; }
+  input[type=text]:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { resize: vertical; }
+  label { display: block; margin: 10px 0 4px; color: var(--muted); font-size: 12px;
+          text-transform: uppercase; letter-spacing: .06em; }
+  tr.conflict td { background: #2a1717; }
   form.inline { display: inline; }
   pre { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
         padding: 10px 12px; overflow: auto; max-height: 340px; margin: 0; font-size: 12px; }

@@ -9,13 +9,24 @@ import datetime
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from .diagnosis import (
+    CONCLUSION_LABELS,
+    CONCLUSION_TONES,
+    DiagnosisInputError,
+    TargetNotFound,
+    TraceNotArchived,
+    parse_diagnosis_spec,
+    run_diagnosis,
+)
 from .otlp import OtlpParseError, export_response, parse_trace_request
 from .sampler import (
     DEFAULT_CAPACITY,
@@ -91,6 +102,12 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _fmt_bound(value, infinity: str) -> str:
+    """Render an offset/diff bound; None means unbounded in that direction."""
+
+    return infinity if value is None else f"{value} ns"
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -124,6 +141,7 @@ def create_app(
     templates.env.filters["pretty_json"] = _pretty_json
     templates.env.filters["duration"] = _format_duration
     templates.env.filters["utc_time"] = _format_time
+    templates.env.filters["conclusion_label"] = lambda c: CONCLUSION_LABELS.get(c, c)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -160,13 +178,22 @@ def create_app(
         """Run due archive writes inline so a page reflects just-finished work."""
         sampler.tick()
 
-    def overview(request: Request) -> HTMLResponse:
+    def overview(
+        request: Request, status_code: int = 200, **extra
+    ) -> HTMLResponse:
         traces, total = store.list_traces(limit=50, offset=0)
-        return render(
+        diagnoses, _ = store.list_diagnoses(limit=20)
+        context = page_context(
             request,
-            "index.html",
-            page_context(request, traces=traces, total=total, limit=50, offset=0),
+            traces=traces,
+            total=total,
+            limit=50,
+            offset=0,
+            diagnoses=diagnoses,
+            diagnosis_error=None,
         )
+        context.update(extra)
+        return render(request, "index.html", context, status_code=status_code)
 
     # -- OTLP ingest --------------------------------------------------------
     @app.post("/v1/traces")
@@ -217,6 +244,7 @@ def create_app(
     ):
         offset = max(0, offset)
         traces, total = store.list_traces(limit=limit, offset=offset)
+        diagnoses, _ = store.list_diagnoses(limit=20)
         return render(
             request,
             "index.html",
@@ -226,6 +254,8 @@ def create_app(
                 total=total,
                 limit=limit,
                 offset=offset,
+                diagnoses=diagnoses,
+                diagnosis_error=None,
             ),
         )
 
@@ -240,6 +270,139 @@ def create_app(
                 status_code=404,
             )
         return render(request, "trace.html", page_context(request, trace=trace))
+
+    # -- Diagnosis ----------------------------------------------------------
+    def _diagnose_and_save(spec: dict) -> dict:
+        """Run the diagnosis on one committed snapshot, then persist it.
+
+        The diagnosis number is produced only when the save succeeds.
+        """
+
+        record = run_diagnosis(store, spec)
+        diagnosis_id = store.save_diagnosis(record)
+        saved = store.get_diagnosis(diagnosis_id)
+        if saved is None:  # pragma: no cover - defensive
+            raise RuntimeError("diagnosis was not persisted")
+        return saved
+
+    def _diagnosis_view(record: dict) -> dict:
+        bounds = record.get("deltaBoundsNs") or {}
+        corrected = record.get("correctedStartDiffNs") or {}
+        view = {
+            "label": CONCLUSION_LABELS.get(
+                record.get("conclusion"), record.get("conclusion")
+            ),
+            "tone": CONCLUSION_TONES.get(record.get("conclusion"), ""),
+            "min_delta": _fmt_bound(bounds.get("min"), "−∞"),
+            "max_delta": _fmt_bound(bounds.get("max"), "+∞"),
+            "min_corr": _fmt_bound(corrected.get("min"), "−∞"),
+            "max_corr": _fmt_bound(corrected.get("max"), "+∞"),
+            "conflict_indices": [],
+            "conflict_calls": [],
+        }
+        conflict = record.get("conflict")
+        if conflict:
+            indices = [
+                i
+                for i in conflict.get("callIndices") or []
+                if 0 <= i < len(record.get("calls") or [])
+            ]
+            view["conflict_indices"] = indices
+            view["conflict_calls"] = [
+                dict(record["calls"][i], index=i) for i in indices
+            ]
+        return view
+
+    @app.post("/diagnoses", response_class=HTMLResponse)
+    async def create_diagnosis_page(request: Request):
+        form = parse_qs((await request.body()).decode("utf-8", "replace"))
+
+        def field(name: str) -> str:
+            return form.get(name, [""])[0]
+
+        tokens = re.split(r"[\s,]+", field("trace_ids").strip())
+        spec_body = {
+            "traceIds": [token for token in tokens if token],
+            "targets": [
+                {"traceId": field("target_a_trace"), "spanId": field("target_a_span")},
+                {"traceId": field("target_b_trace"), "spanId": field("target_b_span")},
+            ],
+        }
+        try:
+            spec = parse_diagnosis_spec(spec_body)
+        except DiagnosisInputError as exc:
+            return overview(request, status_code=400, diagnosis_error=str(exc))
+        try:
+            saved = _diagnose_and_save(spec)
+        except TraceNotArchived as exc:
+            return overview(request, status_code=404, diagnosis_error=str(exc))
+        except TargetNotFound as exc:
+            return overview(request, status_code=400, diagnosis_error=str(exc))
+        except Exception:
+            log.exception("diagnosis failed")
+            return overview(
+                request,
+                status_code=500,
+                diagnosis_error="diagnosis could not be computed or saved",
+            )
+        return RedirectResponse(f"/diagnoses/{saved['id']}", status_code=303)
+
+    @app.get("/diagnoses/{diagnosis_id}", response_class=HTMLResponse)
+    async def diagnosis_page(request: Request, diagnosis_id: int):
+        record = store.get_diagnosis(diagnosis_id)
+        if record is None:
+            return render(
+                request,
+                "diagnosis_missing.html",
+                page_context(request, diagnosis_id=diagnosis_id),
+                status_code=404,
+            )
+        return render(
+            request,
+            "diagnosis.html",
+            page_context(request, d=record, view=_diagnosis_view(record)),
+        )
+
+    @app.get("/api/diagnoses")
+    async def api_diagnoses(limit: int = 50, offset: int = 0) -> dict:
+        items, total = store.list_diagnoses(limit=limit, offset=offset)
+        return {"total": total, "diagnoses": items}
+
+    @app.post("/api/diagnoses")
+    async def api_create_diagnosis(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400, content={"error": "request body must be JSON"}
+            )
+        try:
+            spec = parse_diagnosis_spec(body)
+        except DiagnosisInputError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        try:
+            saved = _diagnose_and_save(spec)
+        except TraceNotArchived as exc:
+            return JSONResponse(status_code=404, content={"error": str(exc)})
+        except TargetNotFound as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        except Exception:
+            log.exception("diagnosis failed")
+            return JSONResponse(
+                status_code=500,
+                content={"error": "diagnosis could not be computed or saved"},
+            )
+        # The diagnosis number is returned only after the save committed.
+        return JSONResponse(status_code=201, content=saved)
+
+    @app.get("/api/diagnoses/{diagnosis_id}")
+    async def api_diagnosis(diagnosis_id: int):
+        record = store.get_diagnosis(diagnosis_id)
+        if record is None:
+            return JSONResponse(
+                status_code=404, content={"error": "no such diagnosis"}
+            )
+        return record
 
     @app.post("/pause", response_class=HTMLResponse)
     async def page_pause(request: Request):

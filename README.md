@@ -44,6 +44,50 @@ stored normally and the OTLP response reports the rejection count:
 Rejection reasons: `capacity`, `window_closed`, `span_limit`, `invalid_span`.
 A fully accepted export returns `{}` per the OTLP spec.
 
+## Clock-skew diagnosis
+
+A duplicate-charge postmortem asks: which started first — the gateway retry or
+the payment service's first debit? Raw timestamps from different hosts cannot
+be compared directly, so the homepage form reconstructs the order from 2–8
+archived traces plus two target spans (traceId + spanId each):
+
+* every service (`service.name`) gets exactly **one fixed clock offset** for
+  the whole diagnosis;
+* every **direct CLIENT→SERVER parent-child call** with complete, valid
+  start/end times contributes two constraints: after applying the offsets,
+  the SERVER interval must lie entirely inside the CLIENT interval;
+* the order of the two target spans' start times is reported only when
+  **every feasible offset assignment** yields the same order (or always
+  equality) — otherwise the conclusion is *cannot be determined*;
+* when no offset assignment satisfies all constraints, the diagnosis lists
+  one set of calls that cannot hold simultaneously.
+
+All traces are read from **one committed snapshot** (a single read
+transaction in WAL mode) while archiving of new traces continues. The
+diagnosis number is returned only after the record has been saved; the saved
+record freezes the conclusion, the two target spans and every call pair that
+took part in the judgement, with identifiers and raw nanosecond times.
+Re-archiving a trace under the same id or restarting the service never
+changes what a diagnosis number shows.
+
+```bash
+curl -s -X POST http://localhost:8000/api/diagnoses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "traceIds": ["<32 hex>", "<32 hex>"],
+    "targets": [
+      {"traceId": "<32 hex>", "spanId": "<16 hex>"},
+      {"traceId": "<32 hex>", "spanId": "<16 hex>"}
+    ]
+  }'
+# → 201 {"id": 1, "conclusion": "a_first", "calls": [...], ...}
+```
+
+Conclusions: `a_first`, `b_first`, `simultaneous`, `indeterminate`
+(offsets allow several orders), `infeasible` (constraints contradict each
+other; `conflict.callIndices` points at the calls that cannot hold
+simultaneously).
+
 ### Pause / resume
 
 Archiving can be paused from the page or via `POST /api/archive/pause`. Traces
@@ -109,8 +153,12 @@ Only OTLP/HTTP JSON is decoded; protobuf exports receive HTTP 415.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/v1/traces` | OTLP/HTTP JSON export |
-| `GET` | `/` | overview: status, archived traces, pause/resume |
+| `GET` | `/` | overview: status, archived traces, diagnosis form |
 | `GET` | `/traces/{traceId}` | every archived span of one trace |
+| `POST` | `/diagnoses` | run a diagnosis from the homepage form |
+| `GET` | `/diagnoses/{id}` | saved diagnosis: conclusion, targets, evidence |
+| `POST` | `/api/diagnoses` | run and save a diagnosis (JSON) |
+| `GET` | `/api/diagnoses` · `/api/diagnoses/{id}` | saved diagnoses (JSON) |
 | `GET` | `/api/status` | sampler state and counters |
 | `GET` | `/api/traces` | archived traces (`limit`, `offset`) |
 | `GET` | `/api/traces/{traceId}` | archived trace as JSON |
@@ -120,9 +168,10 @@ Only OTLP/HTTP JSON is decoded; protobuf exports receive HTTP 415.
 ## Layout
 
 ```
-app/otlp.py      OTLP/HTTP JSON parsing and response shaping
-app/sampler.py   window/slot state machine, dedupe, cap, pause, retry
-app/storage.py   transactional SQLite archive
-app/main.py      FastAPI app factory, routes, templates
-tests/           sampler unit tests and HTTP-level tests
+app/otlp.py       OTLP/HTTP JSON parsing and response shaping
+app/sampler.py    window/slot state machine, dedupe, cap, pause, retry
+app/storage.py    transactional SQLite archive, snapshots, diagnosis records
+app/diagnosis.py  clock-offset constraints, Bellman-Ford solver, conclusion
+app/main.py       FastAPI app factory, routes, templates
+tests/            sampler unit tests and HTTP-level tests
 ```
